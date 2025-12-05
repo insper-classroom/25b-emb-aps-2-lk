@@ -18,7 +18,7 @@
 
 // ===================== Config =====================
 #define SAMPLE_PERIOD       (0.01f)   // 100 Hz
-#define DEADZONE_DPS        (20.0f)   // °/s - Sensibilidade do sensor
+#define DEADZONE_DPS        (1.5f)   // °/s - Sensibilidade do sensor
 #define GAIN_DPS2COUNT      (4.0f)    // °/s -> counts - Velocidade
 #define GYRO_SENS           (131.0f)  // LSB -> °/s (±250 dps)
 #define ACCEL_SENS          (16384.0f)// LSB -> g (±2 g)
