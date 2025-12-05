@@ -138,28 +138,30 @@ static void gpio_callback(uint gpio, uint32_t events) {
     uint32_t now = to_ms_since_boot(get_absolute_time());
     BaseType_t xHigherPriorityTaskWoken = pdFALSE;
 
-    // variáveis estáticas locais (não são globais do ponto de vista da regra)
-    static uint32_t last_toggle_time = 0;
-    static uint32_t last_burst_time  = 0;
-    static uint32_t last_shoot_time  = 0;
-    static uint32_t last_reload_time = 0;
+    // AVISO: As variáveis 'static' foram movidas para dentro dos blocos 'if'
+    // para reduzir o escopo conforme exigido pelo cppcheck.
+    // Isso mantém o comportamento (elas retêm o valor), mas só são visíveis onde usadas.
 
     if (gpio == BTN_TOGGLE_GPIO && (events & GPIO_IRQ_EDGE_FALL)) {
+        static uint32_t last_toggle_time = 0; // Escopo reduzido
         if ((now - last_toggle_time) > DEBOUNCE_MS) {
             last_toggle_time = now;
             xSemaphoreGiveFromISR(toggle_sem, &xHigherPriorityTaskWoken);
         }
     } else if (gpio == BTN_BURST_GPIO && (events & GPIO_IRQ_EDGE_FALL)) {
+        static uint32_t last_burst_time = 0; // Escopo reduzido
         if ((now - last_burst_time) > DEBOUNCE_MS) {
             last_burst_time = now;
             xSemaphoreGiveFromISR(burst_sem, &xHigherPriorityTaskWoken);
         }
     } else if (gpio == BTN_SHOOT_GPIO && (events & GPIO_IRQ_EDGE_FALL)) {
+        static uint32_t last_shoot_time = 0; // Escopo reduzido
         if ((now - last_shoot_time) > DEBOUNCE_MS) {
             last_shoot_time = now;
             xSemaphoreGiveFromISR(shoot_sem, &xHigherPriorityTaskWoken);
         }
     } else if (gpio == BTN_RELOAD_GPIO && (events & GPIO_IRQ_EDGE_FALL)) {
+        static uint32_t last_reload_time = 0; // Escopo reduzido
         if ((now - last_reload_time) > DEBOUNCE_MS) {
             last_reload_time = now;
             xSemaphoreGiveFromISR(reload_sem, &xHigherPriorityTaskWoken);
