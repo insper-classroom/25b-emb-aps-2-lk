@@ -50,32 +50,23 @@
 #define DIR_Y  (-1.0f)     // use 1.0f para inverter vertical
 
 typedef struct {
-    QueueHandle_t q;
-    volatile bool mouse_enabled;  // Flag para habilitar/desabilitar mouse (arma ligada/desligada)
-    volatile bool burst_mode;     // Flag para modo burst (3 tiros)
-    SemaphoreHandle_t toggle_sem; // Semáforo para botão toggle (liga/desliga arma)
-    SemaphoreHandle_t burst_sem;  // Semáforo para botão burst mode
-    SemaphoreHandle_t shoot_sem;  // Semáforo para botão shoot
-    SemaphoreHandle_t reload_sem; // Semáforo para botão reload (tecla R)
-} app_ctx_t;
-
-typedef struct {
     float bx; 
     float by; 
 } gyro_bias_t;
 
-static app_ctx_t *g_ctx = NULL;
-static volatile uint32_t last_toggle_time = 0;
-static volatile uint32_t last_burst_time = 0;
-static volatile uint32_t last_shoot_time = 0;
-static volatile uint32_t last_reload_time = 0;
+// Semáforos globais
+static SemaphoreHandle_t toggle_sem = NULL;
+static SemaphoreHandle_t burst_sem  = NULL;
+static SemaphoreHandle_t shoot_sem  = NULL;
+static SemaphoreHandle_t reload_sem = NULL;
 
+// ===================== Protos =====================
 static void mpu6050_reset(void);
 static void mpu6050_read_raw(int16_t accel[3], int16_t gyro[3], int16_t *temp);
 static inline int16_t sat_i16_from_float(float x);
 static gyro_bias_t calibrate_gyro_bias(void);
 static void gpio_callback(uint gpio, uint32_t events);
-static void setup_buttons(app_ctx_t *ctx);
+static void setup_buttons(void);
 static void mpu6050_task(void *p);
 static void uart_task(void *p);
 
@@ -126,26 +117,19 @@ static gyro_bias_t calibrate_gyro_bias(void) {
 
     printf("=== CALIBRACAO: Mantenha o sensor PARADO e EM PE! ===\n");
     
-    // LED pisca durante calibração
-    //for (int i = 0; i < 3; i++) {
-    //    gpio_put(LED_STATUS_GPIO, 1);
-    //    vTaskDelay(pdMS_TO_TICKS(100));
-    //    gpio_put(LED_STATUS_GPIO, 0);
-    //    vTaskDelay(pdMS_TO_TICKS(100));
-    //}
-    
     for (int i = 0; i < N; ++i) {
         mpu6050_read_raw(accel, gyro, &temp);
         sx += (gyro[0] / GYRO_SENS);  // gyro[0] = X do sensor (rotação)
         sy += (gyro[2] / GYRO_SENS);  // gyro[2] = Z do sensor (inclinação)
         vTaskDelay(pdMS_TO_TICKS(10));
     }
+
     gyro_bias_t b = { .bx = sx / (float)N, .by = sy / (float)N };
     printf("=== CALIBRACAO COMPLETA: bias_x=%.3f, bias_y=%.3f ===\n", b.bx, b.by);
-    
+
     // LED apaga após calibração (arma inicia DESLIGADA)
     gpio_put(LED_STATUS_GPIO, 0);
-    
+
     return b;
 }
 
@@ -153,85 +137,86 @@ static gyro_bias_t calibrate_gyro_bias(void) {
 static void gpio_callback(uint gpio, uint32_t events) {
     uint32_t now = to_ms_since_boot(get_absolute_time());
     BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-    
+
+    // variáveis estáticas locais (não são globais do ponto de vista da regra)
+    static uint32_t last_toggle_time = 0;
+    static uint32_t last_burst_time  = 0;
+    static uint32_t last_shoot_time  = 0;
+    static uint32_t last_reload_time = 0;
+
     if (gpio == BTN_TOGGLE_GPIO && (events & GPIO_IRQ_EDGE_FALL)) {
-        // Botão liga/desliga ARMA
         if ((now - last_toggle_time) > DEBOUNCE_MS) {
             last_toggle_time = now;
-            xSemaphoreGiveFromISR(g_ctx->toggle_sem, &xHigherPriorityTaskWoken);
+            xSemaphoreGiveFromISR(toggle_sem, &xHigherPriorityTaskWoken);
         }
-    }
-    else if (gpio == BTN_BURST_GPIO && (events & GPIO_IRQ_EDGE_FALL)) {
-        // Botão modo burst (3 tiros)
+    } else if (gpio == BTN_BURST_GPIO && (events & GPIO_IRQ_EDGE_FALL)) {
         if ((now - last_burst_time) > DEBOUNCE_MS) {
             last_burst_time = now;
-            xSemaphoreGiveFromISR(g_ctx->burst_sem, &xHigherPriorityTaskWoken);
+            xSemaphoreGiveFromISR(burst_sem, &xHigherPriorityTaskWoken);
         }
-    }
-    else if (gpio == BTN_SHOOT_GPIO && (events & GPIO_IRQ_EDGE_FALL)) {
-        // Botão disparar (APENAS NO FALL - apertar)
+    } else if (gpio == BTN_SHOOT_GPIO && (events & GPIO_IRQ_EDGE_FALL)) {
         if ((now - last_shoot_time) > DEBOUNCE_MS) {
             last_shoot_time = now;
-            xSemaphoreGiveFromISR(g_ctx->shoot_sem, &xHigherPriorityTaskWoken);
+            xSemaphoreGiveFromISR(shoot_sem, &xHigherPriorityTaskWoken);
         }
-    }
-    else if (gpio == BTN_RELOAD_GPIO && (events & GPIO_IRQ_EDGE_FALL)) {
-        // Botão reload (tecla R)
+    } else if (gpio == BTN_RELOAD_GPIO && (events & GPIO_IRQ_EDGE_FALL)) {
         if ((now - last_reload_time) > DEBOUNCE_MS) {
             last_reload_time = now;
-            xSemaphoreGiveFromISR(g_ctx->reload_sem, &xHigherPriorityTaskWoken);
+            xSemaphoreGiveFromISR(reload_sem, &xHigherPriorityTaskWoken);
         }
     }
-    
+
     portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
 }
 
-static void setup_buttons(app_ctx_t *ctx) {
+static void setup_buttons(void) {
+    // Entradas
     gpio_init(BTN_SHOOT_GPIO);
     gpio_set_dir(BTN_SHOOT_GPIO, GPIO_IN);
     gpio_pull_up(BTN_SHOOT_GPIO);
-    
+
     gpio_init(BTN_TOGGLE_GPIO);
     gpio_set_dir(BTN_TOGGLE_GPIO, GPIO_IN);
     gpio_pull_up(BTN_TOGGLE_GPIO);
-    
+
     gpio_init(BTN_BURST_GPIO);
     gpio_set_dir(BTN_BURST_GPIO, GPIO_IN);
     gpio_pull_up(BTN_BURST_GPIO);
-    
+
     gpio_init(BTN_RELOAD_GPIO);
     gpio_set_dir(BTN_RELOAD_GPIO, GPIO_IN);
     gpio_pull_up(BTN_RELOAD_GPIO);
-    
+
+    // LED
     gpio_init(LED_STATUS_GPIO);
     gpio_set_dir(LED_STATUS_GPIO, GPIO_OUT);
-    gpio_put(LED_STATUS_GPIO, 0);  // Inicia desligado
-    
-    gpio_set_irq_enabled_with_callback(BTN_SHOOT_GPIO, 
+    gpio_put(LED_STATUS_GPIO, 0);
+
+    // Interrupções
+    gpio_set_irq_enabled_with_callback(BTN_SHOOT_GPIO,
                                        GPIO_IRQ_EDGE_FALL,
                                        true, &gpio_callback);
     gpio_set_irq_enabled(BTN_TOGGLE_GPIO, GPIO_IRQ_EDGE_FALL, true);
     gpio_set_irq_enabled(BTN_BURST_GPIO, GPIO_IRQ_EDGE_FALL, true);
     gpio_set_irq_enabled(BTN_RELOAD_GPIO, GPIO_IRQ_EDGE_FALL, true);
-    
-    ctx->toggle_sem = xSemaphoreCreateBinary();
-    ctx->burst_sem = xSemaphoreCreateBinary();
-    ctx->shoot_sem = xSemaphoreCreateBinary();
-    ctx->reload_sem = xSemaphoreCreateBinary();
-    
-    // Inicia com arma DESABILITADA e modo burst desativado
-    ctx->mouse_enabled = false;  // DESLIGADO por padrão
-    ctx->burst_mode = false;
-}
 
+    // Semáforos
+    toggle_sem = xSemaphoreCreateBinary();
+    burst_sem  = xSemaphoreCreateBinary();
+    shoot_sem  = xSemaphoreCreateBinary();
+    reload_sem = xSemaphoreCreateBinary();
+}
 
 // ===================== Tasks ======================
 static void mpu6050_task(void *p) {
-    app_ctx_t *ctx = (app_ctx_t *)p;
+    QueueHandle_t q = (QueueHandle_t)p;
+
+    bool mouse_enabled = false;
+    bool burst_mode    = false;
 
     printf("=== SENSOR EM PE, APONTADO PARA DIREITA ===\n");
     printf("=== GPIO 17: Liga/Desliga ARMA ===\n");
-    printf("=== GPIO 16: Modo Burst (3 tiros) ===\n");
+    printf("=== GPIO 22: Modo Burst (3 tiros) ===\n");
     printf("=== GPIO 15: Reload (tecla R) ===\n");
     printf("=== GPIO 14: Disparar (1x ou 3x no apertar) ===\n");
     printf("=== GPIO 13: LED Indicador ===\n");
@@ -258,78 +243,75 @@ static void mpu6050_task(void *p) {
     TickType_t last_wake = xTaskGetTickCount();
 
     while (true) {
-        // ========== BOTÃO LIGA/DESLIGA ARMA ==========
-        if (xSemaphoreTake(ctx->toggle_sem, 0) == pdTRUE) {
-            ctx->mouse_enabled = !ctx->mouse_enabled;
-            
-            // Atualiza LED
-            gpio_put(LED_STATUS_GPIO, ctx->mouse_enabled ? 1 : 0);
-            
+        // Liga/Desliga arma
+        if (xSemaphoreTake(toggle_sem, 0) == pdTRUE) {
+            mouse_enabled = !mouse_enabled;
+
+            gpio_put(LED_STATUS_GPIO, mouse_enabled ? 1 : 0);
+
             printf("\n****************************************\n");
-            printf("*** ARMA %s ***\n", ctx->mouse_enabled ? "LIGADA" : "DESLIGADA");
+            printf("*** ARMA %s ***\n", mouse_enabled ? "LIGADA" : "DESLIGADA");
             printf("****************************************\n");
         }
-        
-        // ========== BOTÃO MODO BURST (só funciona se arma estiver ligada) ==========
-        if (xSemaphoreTake(ctx->burst_sem, 0) == pdTRUE) {
-            if (ctx->mouse_enabled) {
-                ctx->burst_mode = !ctx->burst_mode;
-                
+
+        // Modo burst
+        if (xSemaphoreTake(burst_sem, 0) == pdTRUE) {
+            if (mouse_enabled) {
+                burst_mode = !burst_mode;
+
                 printf("\n========================================\n");
-                printf("*** MODO %s ATIVADO ***\n", ctx->burst_mode ? "BURST (3 TIROS)" : "SEMI-AUTO (1 TIRO)");
+                printf("*** MODO %s ATIVADO ***\n",
+                       burst_mode ? "BURST (3 TIROS)" : "SEMI-AUTO (1 TIRO)");
                 printf("========================================\n");
-                printf("[DEBUG] burst_mode = %d\n", ctx->burst_mode);
+                printf("[DEBUG] burst_mode = %d\n", burst_mode);
             } else {
                 printf("\n[!] ARMA DESLIGADA - Ligue primeiro (GPIO 17)!\n");
             }
         }
-        
-        // ========== BOTÃO DISPARAR (APENAS NO APERTAR - FALL) ==========
-        if (xSemaphoreTake(ctx->shoot_sem, 0) == pdTRUE) {
-            if (ctx->mouse_enabled) {
-                printf("[DEBUG] Disparando! burst_mode = %d\n", ctx->burst_mode);
-                
-                if (ctx->burst_mode) {
-                    // ========== MODO BURST: 3 TIROS ==========
+
+        // Disparo
+        if (xSemaphoreTake(shoot_sem, 0) == pdTRUE) {
+            if (mouse_enabled) {
+                printf("[DEBUG] Disparando! burst_mode = %d\n", burst_mode);
+
+                if (burst_mode) {
                     printf(">>> BURST SHOT (3x)! <<<\n");
-                    
+
                     for (int i = 0; i < 3; i++) {
                         mouse.axis = 6;  // 6 = burst shot
                         mouse.val  = 1;
-                        xQueueSend(ctx->q, &mouse, 0);
-                        printf("[DEBUG] Enviado tiro %d/3 (axis=6)\n", i+1);
-                        
-                        if (i < 2) {  // Delay entre tiros
+                        xQueueSend(q, &mouse, 0);
+                        printf("[DEBUG] Enviado tiro %d/3 (axis=6)\n", i + 1);
+
+                        if (i < 2) {
                             vTaskDelay(pdMS_TO_TICKS(BURST_DELAY_MS));
                         }
                     }
                 } else {
-                    // ========== MODO SEMI-AUTO: 1 TIRO ==========
                     printf(">>> SINGLE SHOT! <<<\n");
                     mouse.axis = 3;  // 3 = single shot
                     mouse.val  = 1;
-                    xQueueSend(ctx->q, &mouse, 0);
+                    xQueueSend(q, &mouse, 0);
                     printf("[DEBUG] Enviado single shot (axis=3)\n");
                 }
             }
         }
-        
-        // ========== BOTÃO RELOAD (TECLA R) ==========
-        if (xSemaphoreTake(ctx->reload_sem, 0) == pdTRUE) {
+
+        // Reload
+        if (xSemaphoreTake(reload_sem, 0) == pdTRUE) {
             printf(">>> RELOAD! (Tecla R) <<<\n");
             mouse.axis = 7;  // 7 = reload (tecla R)
             mouse.val  = 1;
-            xQueueSend(ctx->q, &mouse, 0);
+            xQueueSend(q, &mouse, 0);
             printf("[DEBUG] Enviado reload (axis=7)\n");
         }
-        
-        // ========== PROCESSAMENTO DO SENSOR (só se arma estiver ligada) ==========
-        if (ctx->mouse_enabled) {
+
+        // Processamento do sensor
+        if (mouse_enabled) {
             mpu6050_read_raw(acceleration, gyro, &temp);
 
-            // Remapeamento de eixos: SENSOR EM PÉ
-            float gx = (gyro[0] / GYRO_SENS) - bias.bx; // gyro[0] = X do sensor (rotação/yaw)
-            float gy = (gyro[2] / GYRO_SENS) - bias.by; // gyro[2] = Z do sensor (inclinação/pitch)
+            float gx = (gyro[0] / GYRO_SENS) - bias.bx; // yaw
+            float gy = (gyro[2] / GYRO_SENS) - bias.by; // pitch
 
             FusionVector gyroscope = {
                 .axis.x = gyro[0] / GYRO_SENS,
@@ -342,33 +324,30 @@ static void mpu6050_task(void *p) {
                 .axis.z = acceleration[1] / ACCEL_SENS,
             };
 
-            // Fusão (mantém orientação disponível)
-            FusionAhrsUpdateNoMagnetometer(&ahrs, gyroscope, accelerometer, SAMPLE_PERIOD);
+            FusionAhrsUpdateNoMagnetometer(&ahrs, gyroscope,
+                                           accelerometer, SAMPLE_PERIOD);
 
-            // Deadzone e ganho
             gx = (fabsf(gx) < DEADZONE_DPS) ? 0.0f : gx;
             gy = (fabsf(gy) < DEADZONE_DPS) ? 0.0f : gy;
 
             float vx = DIR_X * gx * GAIN_DPS2COUNT;
             float vy = DIR_Y * gy * GAIN_DPS2COUNT;
 
-            // Eixo X
             mouse.axis = 0;
             mouse.val  = sat_i16_from_float(vx);
-            xQueueSend(ctx->q, &mouse, 0);
+            xQueueSend(q, &mouse, 0);
 
-            // Eixo Y
             mouse.axis = 1;
             mouse.val  = sat_i16_from_float(vy);
-            xQueueSend(ctx->q, &mouse, 0);
+            xQueueSend(q, &mouse, 0);
         }
 
         vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(10)); // 100 Hz
     }
 }
 
-static void uart_task(void *p){
-    app_ctx_t *ctx = (app_ctx_t *)p;
+static void uart_task(void *p) {
+    QueueHandle_t q = (QueueHandle_t)p;
     mouse_t mouse;
 
     uart_init(uart0, 115200);
@@ -376,12 +355,10 @@ static void uart_task(void *p){
     gpio_set_function(UART_RX_PIN, GPIO_FUNC_UART);
 
     while (1) {
-        if (xQueueReceive(ctx->q, &mouse, portMAX_DELAY)) {
-            // Sync
+        if (xQueueReceive(q, &mouse, portMAX_DELAY)) {
             uart_putc_raw(uart0, 0xFF);
-            // Eixo
             uart_putc_raw(uart0, (uint8_t)mouse.axis);
-            // Valor (LSB, MSB) como int16_t little-endian
+
             uint16_t u = (uint16_t)mouse.val;
             uart_putc_raw(uart0, (uint8_t)(u & 0xFF));
             uart_putc_raw(uart0, (uint8_t)((u >> 8) & 0xFF));
@@ -392,20 +369,15 @@ static void uart_task(void *p){
 int main(void) {
     stdio_init_all();
 
-    app_ctx_t *ctx = (app_ctx_t *)pvPortMalloc(sizeof(app_ctx_t));
-    ctx->q = xQueueCreate(10, sizeof(mouse_t));
-    ctx->mouse_enabled = false;  // Inicia DESLIGADO
-    ctx->burst_mode = false;     // Inicia em modo semi-auto
-    
-    // Armazena contexto global para callbacks
-    g_ctx = ctx;
-    
-    // Configura botões com callbacks
-    setup_buttons(ctx);
+    QueueHandle_t q = xQueueCreate(10, sizeof(mouse_t));
 
-    xTaskCreate(mpu6050_task, "mpu6050_Task", 8192, ctx, 1, NULL);
-    xTaskCreate(uart_task,    "uart_Task",    1024, ctx, 1, NULL);
+    setup_buttons();
+
+    xTaskCreate(mpu6050_task, "mpu6050_Task", 8192, q, 1, NULL);
+    xTaskCreate(uart_task,    "uart_Task",    1024, q, 1, NULL);
 
     vTaskStartScheduler();
-    while (true) { }
+    while (true) {
+        // nunca deveria chegar aqui
+    }
 }
